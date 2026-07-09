@@ -1,0 +1,58 @@
+scope: tsdb-cluster
+name: $NODE_NAME
+restapi:
+  listen: $NODE_IP:8008
+  connect_address: $NODE_IP:8008
+etcd3:
+  hosts:
+    - ${EtcdEni1.PrimaryPrivateIpAddress}:2379
+    - ${EtcdEni2.PrimaryPrivateIpAddress}:2379
+    - ${EtcdEni3.PrimaryPrivateIpAddress}:2379
+bootstrap:
+  post_bootstrap: /etc/patroni/post_bootstrap.sh
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    failsafe_mode: true
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        shared_preload_libraries: timescaledb
+        ssl: "on"
+        ssl_cert_file: /etc/patroni/certs/server.crt
+        ssl_key_file: /etc/patroni/certs/server.key
+        archive_mode: "on"
+        archive_command: 'pgbackrest --stanza=tsdb archive-push %p'
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: $NODE_IP:5432
+  data_dir: /var/lib/postgresql/16/patroni
+  bin_dir: /usr/lib/postgresql/16/bin
+  pg_hba:
+    - local all all peer
+    - host all all 127.0.0.1/32 md5
+    - hostssl all all ${VpcCidr} md5
+    - hostssl replication replicator ${VpcCidr} md5
+  authentication:
+    superuser:
+      username: postgres
+      password: testpass123
+    replication:
+      username: replicator
+      password: replpass123
+  parameters:
+    shared_preload_libraries: timescaledb
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

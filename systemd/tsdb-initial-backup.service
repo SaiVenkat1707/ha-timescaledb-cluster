@@ -1,0 +1,9 @@
+[Unit]
+Description=TSDB initial pgBackRest backup (post-boot, leader only)
+After=patroni.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/opt/initial_backup.sh
+[Install]
+WantedBy=multi-user.target

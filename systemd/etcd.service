@@ -1,0 +1,11 @@
+[Unit]
+Description=etcd
+After=network.target
+[Service]
+Type=notify
+User=etcd
+ExecStart=/usr/local/bin/etcd --name $NAME --data-dir /var/lib/etcd --listen-client-urls http://$NODE_IP:2379,http://127.0.0.1:2379 --advertise-client-urls http://$NODE_IP:2379 --listen-peer-urls http://$NODE_IP:2380 --initial-advertise-peer-urls http://$NODE_IP:2380 --initial-cluster etcd1=http://${EtcdEni1.PrimaryPrivateIpAddress}:2380,etcd2=http://${EtcdEni2.PrimaryPrivateIpAddress}:2380,etcd3=http://${EtcdEni3.PrimaryPrivateIpAddress}:2380 --initial-cluster-state new --initial-cluster-token tsdb-etcd
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
