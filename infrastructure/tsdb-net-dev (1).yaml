@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DEV-ONLY networking scaffold for the TimescaleDB HA stack. Stands up the same
+  network SHAPE a production team would already own: one VPC, three private
+  subnets across three AZs, a NAT gateway for egress, and an S3 gateway endpoint.
+  Deploy this FIRST in an empty dev account, read its Outputs, then pass those
+  Outputs (VpcId, SubnetIdA/B/C, VpcCidr) as parameters to tsdb-ha-full.yaml.
+  In production you do NOT use this - you use the team's existing network.
+  This is throwaway: deploy, test the DB stack, then delete both stacks.
+
+  COST while running: NAT gateway ~$0.045/hr + data; everything else here is
+  free or negligible. Delete the stack to stop it. The S3 gateway endpoint and
+  all subnets/route tables are free.
+
+# =============================================================================
+Parameters:
+# =============================================================================
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for the dev VPC. The /24 subnets below are carved from this.
+
+# =============================================================================
+Resources:
+# =============================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: tsdb-dev-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: tsdb-dev-igw }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet only hosts the NAT gateway.
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: tsdb-dev-public }]
+
+  # Three private subnets, one per AZ - this is what the DB stack deploys into.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      Tags: [{ Key: Name, Value: tsdb-dev-private-a }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      Tags: [{ Key: Name, Value: tsdb-dev-private-b }]
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: 10.0.3.0/24
+      Tags: [{ Key: Name, Value: tsdb-dev-private-c }]
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: tsdb-dev-nat-eip }]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: tsdb-dev-nat }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: tsdb-dev-rt-public }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: tsdb-dev-rt-private }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetCAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTable
+
+  # S3 gateway endpoint - mirrors production so backup/archival S3 traffic does
+  # not traverse the NAT. Attached to the private route table.
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+# =============================================================================
+Outputs:
+# =============================================================================
+# Feed these straight into tsdb-ha-full.yaml as its parameters.
+  VpcId:
+    Description: Pass as the DB stack's VpcId parameter.
+    Value: !Ref Vpc
+  SubnetIdA:
+    Description: Pass as SubnetIdA (AZ a, private).
+    Value: !Ref PrivateSubnetA
+  SubnetIdB:
+    Description: Pass as SubnetIdB (AZ b, private).
+    Value: !Ref PrivateSubnetB
+  SubnetIdC:
+    Description: Pass as SubnetIdC (AZ c, private).
+    Value: !Ref PrivateSubnetC
+  VpcCidr:
+    Description: Pass as VpcCidr.
+    Value: !Ref VpcCidr
