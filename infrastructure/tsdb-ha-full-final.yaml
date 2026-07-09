@@ -1,0 +1,1070 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  TimescaleDB HA stack (single template) for vehicle telemetry. No manual SSH.
+  Deploys into an EXISTING VPC + 3 private subnets (passed as parameters); does
+  NOT create networking. Access via SSM (no port 22). 3-node etcd, 2 DB nodes
+  (Postgres 16 + TimescaleDB) under Patroni with auto-failover. No hardcoded IPs:
+  ENIs are pre-created so addresses are known up front and wired via GetAtt.
+  Internal NLB: 5432 writes (leader), 5433 reads (primary+replica). pgBackRest to
+  S3 (weekly full + daily incr + WAL/PITR). Parquet cold-archive to S3 for chunks
+  older than 90 days (dropped from DB, not queried back). TLS (self-signed - replace
+  for prod), EBS+S3 encryption, least-privilege SGs. Instance sizes parameterized.
+  Requires params: VpcId, SubnetIdA/B/C (private, 3 AZs, NAT egress), VpcCidr.
+  COST: the NLB (~$16/mo) is the main standing charge (the VPC/NAT are the
+  caller's existing infra). After stack delete, CONFIRM the NLB, the 5 ENIs, and
+  any EBS snapshots are gone.
+
+# =============================================================================
+Parameters:
+# =============================================================================
+  DbInstanceType:
+    Type: String
+    Default: t4g.micro
+    Description: DB node size. Test default t4g.micro; production e.g. r7g.4xlarge.
+
+  EtcdInstanceType:
+    Type: String
+    Default: t4g.small
+    Description: etcd node size. Test default t4g.small.
+
+  DbVolumeSizeGb:
+    Type: Number
+    Default: 8
+    Description: EBS size per DB node (GB). Test default 8; production e.g. 1500.
+
+  UbuntuArmAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id
+    Description: Latest Ubuntu 22.04 ARM AMI, auto-resolved (never goes stale).
+
+  EtcdVersion:
+    Type: String
+    Default: v3.5.13
+    Description: etcd release to install.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy into.
+
+  SubnetIdA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing PRIVATE subnet in AZ a (must have NAT egress).
+
+  SubnetIdB:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing PRIVATE subnet in AZ b (must have NAT egress).
+
+  SubnetIdC:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing PRIVATE subnet in AZ c (must have NAT egress).
+
+  VpcCidr:
+    Type: String
+    Description: CIDR of the existing VPC (used for NLB ingress and pg_hba rules), e.g. 10.20.0.0/16.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+# =============================================================================
+Resources:
+# =============================================================================
+
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Security groups (least privilege; egress left at default allow-all)
+  # ---------------------------------------------------------------------------
+  NlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NLB - accepts client connections from inside the VPC
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { Description: write endpoint, IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: !Ref VpcCidr }
+        - { Description: read endpoint,  IpProtocol: tcp, FromPort: 5433, ToPort: 5433, CidrIp: !Ref VpcCidr }
+      Tags: [{ Key: Name, Value: tsdb-nlb-sg }]
+      # PRODUCTION: replace VpcCidr ingress with the consumer's security group.
+
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB nodes (Postgres 5432, Patroni REST 8008)
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: tsdb-db-sg }]
+
+  EtcdSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: etcd nodes (client 2379, peer 2380)
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: tsdb-etcd-sg }]
+
+  # DB ingress: Postgres from NLB, Patroni health from NLB, and DB<->DB.
+  DbIngressPgFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref DbSg, IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref NlbSg, Description: Postgres from NLB }
+  DbIngressApiFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref DbSg, IpProtocol: tcp, FromPort: 8008, ToPort: 8008, SourceSecurityGroupId: !Ref NlbSg, Description: Patroni health from NLB }
+  DbIngressPgFromDb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref DbSg, IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref DbSg, Description: Postgres replication between DB nodes }
+  DbIngressApiFromDb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref DbSg, IpProtocol: tcp, FromPort: 8008, ToPort: 8008, SourceSecurityGroupId: !Ref DbSg, Description: Patroni REST between DB nodes }
+
+  # etcd ingress: client from DB nodes, client+peer between etcd nodes.
+  EtcdIngressClientFromDb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref EtcdSg, IpProtocol: tcp, FromPort: 2379, ToPort: 2379, SourceSecurityGroupId: !Ref DbSg, Description: etcd client from DB (Patroni) }
+  EtcdIngressClientFromEtcd:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref EtcdSg, IpProtocol: tcp, FromPort: 2379, ToPort: 2379, SourceSecurityGroupId: !Ref EtcdSg, Description: etcd client between members }
+  EtcdIngressPeerFromEtcd:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref EtcdSg, IpProtocol: tcp, FromPort: 2380, ToPort: 2380, SourceSecurityGroupId: !Ref EtcdSg, Description: etcd peer between members }
+
+  # ---------------------------------------------------------------------------
+  # IAM (SSM for access; S3 for backup + archival on DB nodes only)
+  # ---------------------------------------------------------------------------
+  EtcdRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+
+  EtcdInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref EtcdRole] }
+
+  DbRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: tsdb-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: [!GetAtt BackupBucket.Arn, !GetAtt ArchiveBucket.Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub '${BackupBucket.Arn}/*', !Sub '${ArchiveBucket.Arn}/*']
+
+  DbInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref DbRole] }
+
+  # ---------------------------------------------------------------------------
+  # S3 buckets (encrypted; backup bucket versioned)
+  # ---------------------------------------------------------------------------
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+
+  # ---------------------------------------------------------------------------
+  # Elastic Network Interfaces - pre-created so their private IPs are known
+  # BEFORE any instance boots. This lets us wire the etcd cluster membership
+  # (and Patroni's etcd host list) via !GetAtt without hardcoding IPs, and lets
+  # the subnets assign whatever addresses they like. Bonus: an ENI keeps its IP
+  # if its instance is replaced (reattach the ENI -> same IP -> cluster heals).
+  # ---------------------------------------------------------------------------
+  EtcdEni1:
+    Type: AWS::EC2::NetworkInterface
+    Properties: { SubnetId: !Ref SubnetIdA, GroupSet: [!Ref EtcdSg], Tags: [{ Key: Name, Value: tsdb-etcd-1-eni }] }
+  EtcdEni2:
+    Type: AWS::EC2::NetworkInterface
+    Properties: { SubnetId: !Ref SubnetIdB, GroupSet: [!Ref EtcdSg], Tags: [{ Key: Name, Value: tsdb-etcd-2-eni }] }
+  EtcdEni3:
+    Type: AWS::EC2::NetworkInterface
+    Properties: { SubnetId: !Ref SubnetIdC, GroupSet: [!Ref EtcdSg], Tags: [{ Key: Name, Value: tsdb-etcd-3-eni }] }
+  DbEni1:
+    Type: AWS::EC2::NetworkInterface
+    Properties: { SubnetId: !Ref SubnetIdA, GroupSet: [!Ref DbSg], Tags: [{ Key: Name, Value: tsdb-db-1-eni }] }
+  DbEni2:
+    Type: AWS::EC2::NetworkInterface
+    Properties: { SubnetId: !Ref SubnetIdB, GroupSet: [!Ref DbSg], Tags: [{ Key: Name, Value: tsdb-db-2-eni }] }
+
+  # ---------------------------------------------------------------------------
+  # etcd nodes (one user-data for all three; each derives its own IP/name)
+  # ---------------------------------------------------------------------------
+  EtcdNode1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EtcdInstanceType
+      ImageId: !Ref UbuntuArmAmi
+      NetworkInterfaces:
+        - { NetworkInterfaceId: !Ref EtcdEni1, DeviceIndex: 0 }
+      IamInstanceProfile: !Ref EtcdInstanceProfile
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: tsdb-etcd-1 }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/etcd-bootstrap.log 2>&1
+          snap install amazon-ssm-agent --classic 2>/dev/null || true
+          systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || systemctl start amazon-ssm-agent 2>/dev/null || true
+          ETCD_VER=${EtcdVersion}
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          NODE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          NAME=etcd1
+          cd /tmp
+          curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-arm64.tar.gz -o etcd.tar.gz
+          tar xzf etcd.tar.gz
+          cp etcd-$ETCD_VER-linux-arm64/etcd* /usr/local/bin/
+          useradd --system --no-create-home etcd || true
+          mkdir -p /var/lib/etcd && chown etcd:etcd /var/lib/etcd
+          # NOTE: heredoc is UNQUOTED so $NAME/$NODE_IP expand NOW, baking literal
+          # values into the unit file. ExecStart is one line on purpose (avoids
+          # heredoc line-continuation issues). This is the fix for the old bug
+          # where systemd received unexpanded placeholder variables.
+          cat > /etc/systemd/system/etcd.service <<EOF
+          [Unit]
+          Description=etcd
+          After=network.target
+          [Service]
+          Type=notify
+          User=etcd
+          ExecStart=/usr/local/bin/etcd --name $NAME --data-dir /var/lib/etcd --listen-client-urls http://$NODE_IP:2379,http://127.0.0.1:2379 --advertise-client-urls http://$NODE_IP:2379 --listen-peer-urls http://$NODE_IP:2380 --initial-advertise-peer-urls http://$NODE_IP:2380 --initial-cluster etcd1=http://${EtcdEni1.PrimaryPrivateIpAddress}:2380,etcd2=http://${EtcdEni2.PrimaryPrivateIpAddress}:2380,etcd3=http://${EtcdEni3.PrimaryPrivateIpAddress}:2380 --initial-cluster-state new --initial-cluster-token tsdb-etcd
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now etcd
+          echo "ETCD BOOTSTRAP COMPLETE"
+
+  EtcdNode2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EtcdInstanceType
+      ImageId: !Ref UbuntuArmAmi
+      NetworkInterfaces:
+        - { NetworkInterfaceId: !Ref EtcdEni2, DeviceIndex: 0 }
+      IamInstanceProfile: !Ref EtcdInstanceProfile
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: tsdb-etcd-2 }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/etcd-bootstrap.log 2>&1
+          snap install amazon-ssm-agent --classic 2>/dev/null || true
+          systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || systemctl start amazon-ssm-agent 2>/dev/null || true
+          ETCD_VER=${EtcdVersion}
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          NODE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          NAME=etcd2
+          cd /tmp
+          curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-arm64.tar.gz -o etcd.tar.gz
+          tar xzf etcd.tar.gz
+          cp etcd-$ETCD_VER-linux-arm64/etcd* /usr/local/bin/
+          useradd --system --no-create-home etcd || true
+          mkdir -p /var/lib/etcd && chown etcd:etcd /var/lib/etcd
+          cat > /etc/systemd/system/etcd.service <<EOF
+          [Unit]
+          Description=etcd
+          After=network.target
+          [Service]
+          Type=notify
+          User=etcd
+          ExecStart=/usr/local/bin/etcd --name $NAME --data-dir /var/lib/etcd --listen-client-urls http://$NODE_IP:2379,http://127.0.0.1:2379 --advertise-client-urls http://$NODE_IP:2379 --listen-peer-urls http://$NODE_IP:2380 --initial-advertise-peer-urls http://$NODE_IP:2380 --initial-cluster etcd1=http://${EtcdEni1.PrimaryPrivateIpAddress}:2380,etcd2=http://${EtcdEni2.PrimaryPrivateIpAddress}:2380,etcd3=http://${EtcdEni3.PrimaryPrivateIpAddress}:2380 --initial-cluster-state new --initial-cluster-token tsdb-etcd
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now etcd
+          echo "ETCD BOOTSTRAP COMPLETE"
+
+  EtcdNode3:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EtcdInstanceType
+      ImageId: !Ref UbuntuArmAmi
+      NetworkInterfaces:
+        - { NetworkInterfaceId: !Ref EtcdEni3, DeviceIndex: 0 }
+      IamInstanceProfile: !Ref EtcdInstanceProfile
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: tsdb-etcd-3 }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/etcd-bootstrap.log 2>&1
+          snap install amazon-ssm-agent --classic 2>/dev/null || true
+          systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || systemctl start amazon-ssm-agent 2>/dev/null || true
+          ETCD_VER=${EtcdVersion}
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          NODE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          NAME=etcd3
+          cd /tmp
+          curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-arm64.tar.gz -o etcd.tar.gz
+          tar xzf etcd.tar.gz
+          cp etcd-$ETCD_VER-linux-arm64/etcd* /usr/local/bin/
+          useradd --system --no-create-home etcd || true
+          mkdir -p /var/lib/etcd && chown etcd:etcd /var/lib/etcd
+          cat > /etc/systemd/system/etcd.service <<EOF
+          [Unit]
+          Description=etcd
+          After=network.target
+          [Service]
+          Type=notify
+          User=etcd
+          ExecStart=/usr/local/bin/etcd --name $NAME --data-dir /var/lib/etcd --listen-client-urls http://$NODE_IP:2379,http://127.0.0.1:2379 --advertise-client-urls http://$NODE_IP:2379 --listen-peer-urls http://$NODE_IP:2380 --initial-advertise-peer-urls http://$NODE_IP:2380 --initial-cluster etcd1=http://${EtcdEni1.PrimaryPrivateIpAddress}:2380,etcd2=http://${EtcdEni2.PrimaryPrivateIpAddress}:2380,etcd3=http://${EtcdEni3.PrimaryPrivateIpAddress}:2380 --initial-cluster-state new --initial-cluster-token tsdb-etcd
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now etcd
+          echo "ETCD BOOTSTRAP COMPLETE"
+
+  # ---------------------------------------------------------------------------
+  # DB nodes (identical user-data; each derives its own IP/name from IMDS)
+  # The first DB node (pg-node-1) tends to win the initial
+  # election; whichever bootstraps the cluster runs post_bootstrap (schema load)
+  # exactly once. Patroni handles all replication/failover - no manual basebackup.
+  # ---------------------------------------------------------------------------
+  DbNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: [EtcdNode1, EtcdNode2, EtcdNode3]
+    Properties:
+      InstanceType: !Ref DbInstanceType
+      ImageId: !Ref UbuntuArmAmi
+      NetworkInterfaces:
+        - { NetworkInterfaceId: !Ref DbEni1, DeviceIndex: 0 }
+      IamInstanceProfile: !Ref DbInstanceProfile
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: !Ref DbVolumeSizeGb, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: tsdb-db-1 }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/db-bootstrap.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+
+          # values injected by CloudFormation
+          BACKUP_BUCKET="${BackupBucket}"
+          ARCHIVE_BUCKET="${ArchiveBucket}"
+          REGION="${AWS::Region}"
+
+          snap install amazon-ssm-agent --classic 2>/dev/null || true
+          systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || systemctl start amazon-ssm-agent 2>/dev/null || true
+
+          # discover own identity (IMDSv2)
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          NODE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          NODE_NAME=pg-node-1
+
+          apt-get update
+          apt-get install -y curl gnupg lsb-release ca-certificates python3-pip jq openssl
+          install -d /usr/share/postgresql-common/pgdg
+          curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          curl -s https://packagecloud.io/install/repositories/timescale/timescaledb/script.deb.sh | bash
+          apt-get update
+          apt-get install -y postgresql-16 timescaledb-2-postgresql-16 pgbackrest
+          # Install Python deps. Old pip (e.g. Ubuntu 22.04 system pip) has no
+          # --break-system-packages flag and doesn't need it; newer pip is
+          # externally-managed and does. Try plain first, fall back to the flag.
+          pip3 install 'patroni[etcd3]' psycopg2-binary pyarrow boto3 || pip3 install --break-system-packages 'patroni[etcd3]' psycopg2-binary pyarrow boto3
+          systemctl stop postgresql || true
+          systemctl disable postgresql || true
+
+          # TLS (self-signed; REPLACE with CA-backed certs for production)
+          mkdir -p /etc/patroni/certs
+          openssl req -new -x509 -days 3650 -nodes -text -out /etc/patroni/certs/server.crt -keyout /etc/patroni/certs/server.key -subj "/CN=$NODE_IP"
+          chmod 600 /etc/patroni/certs/server.key
+
+          # pgBackRest config -> S3
+          mkdir -p /etc/pgbackrest /var/log/pgbackrest
+          chown postgres:postgres /var/log/pgbackrest
+          cat > /etc/pgbackrest/pgbackrest.conf <<PGBR
+          [global]
+          repo1-type=s3
+          repo1-s3-bucket=$BACKUP_BUCKET
+          repo1-s3-region=$REGION
+          repo1-s3-endpoint=s3.$REGION.amazonaws.com
+          repo1-s3-key-type=auto
+          repo1-path=/pgbackrest
+          repo1-retention-full=4
+          start-fast=y
+          [tsdb]
+          pg1-path=/var/lib/postgresql/16/patroni
+          pg1-port=5432
+          pg1-user=postgres
+          PGBR
+
+          # Patroni data dir
+          mkdir -p /var/lib/postgresql/16/patroni
+          chown postgres:postgres /var/lib/postgresql/16/patroni
+          chmod 700 /var/lib/postgresql/16/patroni
+
+          # schema (DDL only) - loaded once via Patroni post_bootstrap
+          cat > /etc/patroni/schema.sql <<'SCHEMA'
+          CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+          CREATE TABLE vehicle_snapshots (
+              captured_at         TIMESTAMPTZ NOT NULL,   -- = envelope.eventOccurTimeStamp
+              vin                 TEXT        NOT NULL,
+              envelope            JSONB,                  -- per-event metadata
+              location            JSONB,
+              cockpit_data        JSONB,
+              tire_pressure_data  JSONB,
+              health_status_data  JSONB,
+              body_control        JSONB,
+              driver_behavior     JSONB,
+              adas_context        JSONB,
+              cabin_status        JSONB,
+              lighting_visibility JSONB,
+              PRIMARY KEY (vin, captured_at)
+          );
+
+          SELECT create_hypertable('vehicle_snapshots', by_range('captured_at', INTERVAL '1 day'));
+
+          ALTER TABLE vehicle_snapshots SET (
+              timescaledb.compress,
+              timescaledb.compress_segmentby = 'vin',
+              timescaledb.compress_orderby   = 'captured_at DESC'
+          );
+
+          -- add_columnstore_policy is a PROCEDURE on current TimescaleDB -> use CALL.
+          -- Older TimescaleDB versions instead use: SELECT add_compression_policy('vehicle_snapshots', INTERVAL '7 days');
+          CALL add_columnstore_policy('vehicle_snapshots', after => INTERVAL '7 days');
+          SCHEMA
+
+          cat > /etc/patroni/post_bootstrap.sh <<'PB'
+          #!/bin/bash
+          set -e
+          psql -U postgres -h /var/run/postgresql -f /etc/patroni/schema.sql
+          PB
+          chmod +x /etc/patroni/post_bootstrap.sh
+
+          # patroni.yml (UNQUOTED heredoc: $NODE_NAME/$NODE_IP expand now)
+          cat > /etc/patroni/patroni.yml <<PATRONI
+          scope: tsdb-cluster
+          name: $NODE_NAME
+          restapi:
+            listen: $NODE_IP:8008
+            connect_address: $NODE_IP:8008
+          etcd3:
+            hosts:
+              - ${EtcdEni1.PrimaryPrivateIpAddress}:2379
+              - ${EtcdEni2.PrimaryPrivateIpAddress}:2379
+              - ${EtcdEni3.PrimaryPrivateIpAddress}:2379
+          bootstrap:
+            post_bootstrap: /etc/patroni/post_bootstrap.sh
+            dcs:
+              ttl: 30
+              loop_wait: 10
+              retry_timeout: 10
+              maximum_lag_on_failover: 1048576
+              failsafe_mode: true
+              postgresql:
+                use_pg_rewind: true
+                parameters:
+                  wal_level: replica
+                  hot_standby: "on"
+                  max_wal_senders: 10
+                  max_replication_slots: 10
+                  shared_preload_libraries: timescaledb
+                  ssl: "on"
+                  ssl_cert_file: /etc/patroni/certs/server.crt
+                  ssl_key_file: /etc/patroni/certs/server.key
+                  archive_mode: "on"
+                  archive_command: 'pgbackrest --stanza=tsdb archive-push %p'
+            initdb:
+              - encoding: UTF8
+              - data-checksums
+          postgresql:
+            listen: 0.0.0.0:5432
+            connect_address: $NODE_IP:5432
+            data_dir: /var/lib/postgresql/16/patroni
+            bin_dir: /usr/lib/postgresql/16/bin
+            pg_hba:
+              - local all all peer
+              - host all all 127.0.0.1/32 md5
+              - hostssl all all ${VpcCidr} md5
+              - hostssl replication replicator ${VpcCidr} md5
+            authentication:
+              superuser:
+                username: postgres
+                password: testpass123
+              replication:
+                username: replicator
+                password: replpass123
+            parameters:
+              shared_preload_libraries: timescaledb
+          tags:
+            nofailover: false
+            noloadbalance: false
+            clonefrom: false
+            nosync: false
+          PATRONI
+          chown -R postgres:postgres /etc/patroni
+          chmod 600 /etc/patroni/certs/server.key
+
+          cat > /etc/systemd/system/patroni.service <<'UNIT'
+          [Unit]
+          Description=Patroni
+          After=network.target
+          [Service]
+          Type=simple
+          User=postgres
+          Group=postgres
+          ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now patroni
+
+          # leader guard
+          cat > /opt/is_leader.sh <<'LEAD'
+          #!/bin/bash
+          # Patroni's REST API binds to the node's private IP (not 127.0.0.1),
+          # so we must query that IP. Derive it from IMDS at runtime.
+          TKN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          IP=$(curl -s -H "X-aws-ec2-metadata-token: $TKN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://$IP:8008/primary)
+          [ "$code" = "200" ]
+          LEAD
+          chmod +x /opt/is_leader.sh
+
+          # backup wrapper: weekly full (Sun) + daily incremental, leader only
+          cat > /opt/backup.sh <<'BK'
+          #!/bin/bash
+          /opt/is_leader.sh || exit 0
+          sudo -u postgres pgbackrest --stanza=tsdb stanza-create 2>/dev/null || true
+          if [ "$(date +%u)" = "7" ]; then T=full; else T=incr; fi
+          sudo -u postgres pgbackrest --stanza=tsdb --type=$T backup
+          BK
+          chmod +x /opt/backup.sh
+
+          # archival wrapper (passes bucket/region to the python job)
+          cat > /opt/archive.sh <<ARCH
+          #!/bin/bash
+          # Run the archival job AS the postgres OS user so local peer auth
+          # succeeds (cron invokes this as root; connecting as postgres over the
+          # unix socket requires the OS user to be postgres). Bucket/region are
+          # passed through into the postgres shell so boto3 can read them.
+          exec sudo -u postgres bash -c 'ARCHIVE_BUCKET="${ArchiveBucket}" REGION="${AWS::Region}" python3 /opt/archive_chunks.py'
+          ARCH
+          chmod +x /opt/archive.sh
+
+          # Parquet archival: export chunks older than 90 days to S3, then drop them.
+          # Cold archive only - NOT queried back through TimescaleDB. Leader only.
+          cat > /opt/archive_chunks.py <<'PY'
+          #!/usr/bin/env python3
+          import os, sys, io
+          import psycopg2, pyarrow as pa, pyarrow.parquet as pq, boto3
+          bucket = os.environ["ARCHIVE_BUCKET"]
+          region = os.environ["REGION"]
+          conn = psycopg2.connect("dbname=postgres user=postgres host=/var/run/postgresql")
+          conn.autocommit = True
+          cur = conn.cursor()
+          cur.execute("SELECT pg_is_in_recovery()")
+          if cur.fetchone()[0]:
+              sys.exit(0)  # replica: do nothing
+          cur.execute("""SELECT chunk_schema, chunk_name FROM timescaledb_information.chunks
+                         WHERE hypertable_name='vehicle_snapshots'
+                           AND range_end < now() - INTERVAL '90 days'""")
+          chunks = cur.fetchall()
+          if not chunks:
+              sys.exit(0)
+          s3 = boto3.client("s3", region_name=region)
+          ok = True
+          for schema, name in chunks:
+              try:
+                  rc = conn.cursor()
+                  rc.execute('SELECT * FROM "%s"."%s"' % (schema, name))
+                  cols = [d[0] for d in rc.description]
+                  data = {c: [] for c in cols}
+                  for row in rc.fetchall():
+                      for c, v in zip(cols, row):
+                          data[c].append(None if v is None else str(v))
+                  buf = io.BytesIO()
+                  pq.write_table(pa.table(data), buf)
+                  s3.put_object(Bucket=bucket, Key="vehicle_snapshots/%s.parquet" % name, Body=buf.getvalue())
+                  rc.close()
+              except Exception as e:
+                  sys.stderr.write("failed %s: %s\n" % (name, e))
+                  ok = False
+          if ok:
+              cur.execute("SELECT drop_chunks('vehicle_snapshots', older_than => INTERVAL '90 days')")
+          PY
+          chmod +x /opt/archive_chunks.py
+
+          cat > /etc/cron.d/tsdb-jobs <<'CRON'
+          0 2 * * * root /opt/backup.sh  >> /var/log/tsdb-backup.log 2>&1
+          0 3 * * * root /opt/archive.sh >> /var/log/tsdb-archive.log 2>&1
+          CRON
+
+          # Initial backup is handled by a POST-BOOT systemd oneshot (below),
+          # NOT inline here. Doing it inline raced Patroni's leader election and
+          # kept failing. The oneshot polls until this node is genuinely the
+          # settled leader, then runs stanza-create + first full backup once.
+          cat > /opt/initial_backup.sh <<'IB'
+          #!/bin/bash
+          # Wait (long, no premature give-up) until this node is the settled leader.
+          # If it becomes a stable replica instead, exit cleanly - the leader's
+          # copy of this oneshot performs the backup.
+          for i in $(seq 1 60); do
+            if /opt/is_leader.sh; then
+              sudo -u postgres pgbackrest --stanza=tsdb stanza-create || true
+              sudo -u postgres pgbackrest --stanza=tsdb --type=full backup || true
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 0
+          IB
+          chmod +x /opt/initial_backup.sh
+
+          cat > /etc/systemd/system/tsdb-initial-backup.service <<'IBU'
+          [Unit]
+          Description=TSDB initial pgBackRest backup (post-boot, leader only)
+          After=patroni.service network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/initial_backup.sh
+          [Install]
+          WantedBy=multi-user.target
+          IBU
+          systemctl daemon-reload
+          systemctl enable tsdb-initial-backup.service || true
+          # start without blocking user-data (the oneshot may poll for minutes)
+          systemctl start --no-block tsdb-initial-backup.service || true
+          echo "DB BOOTSTRAP COMPLETE"
+
+  DbNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: [EtcdNode1, EtcdNode2, EtcdNode3, DbNode1]
+    Properties:
+      InstanceType: !Ref DbInstanceType
+      ImageId: !Ref UbuntuArmAmi
+      NetworkInterfaces:
+        - { NetworkInterfaceId: !Ref DbEni2, DeviceIndex: 0 }
+      IamInstanceProfile: !Ref DbInstanceProfile
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: !Ref DbVolumeSizeGb, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: tsdb-db-2 }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/db-bootstrap.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+
+          BACKUP_BUCKET="${BackupBucket}"
+          ARCHIVE_BUCKET="${ArchiveBucket}"
+          REGION="${AWS::Region}"
+
+          snap install amazon-ssm-agent --classic 2>/dev/null || true
+          systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || systemctl start amazon-ssm-agent 2>/dev/null || true
+
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          NODE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          NODE_NAME=pg-node-2
+
+          apt-get update
+          apt-get install -y curl gnupg lsb-release ca-certificates python3-pip jq openssl
+          install -d /usr/share/postgresql-common/pgdg
+          curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          curl -s https://packagecloud.io/install/repositories/timescale/timescaledb/script.deb.sh | bash
+          apt-get update
+          apt-get install -y postgresql-16 timescaledb-2-postgresql-16 pgbackrest
+          # Install Python deps. Old pip (e.g. Ubuntu 22.04 system pip) has no
+          # --break-system-packages flag and doesn't need it; newer pip is
+          # externally-managed and does. Try plain first, fall back to the flag.
+          pip3 install 'patroni[etcd3]' psycopg2-binary pyarrow boto3 || pip3 install --break-system-packages 'patroni[etcd3]' psycopg2-binary pyarrow boto3
+          systemctl stop postgresql || true
+          systemctl disable postgresql || true
+
+          mkdir -p /etc/patroni/certs
+          openssl req -new -x509 -days 3650 -nodes -text -out /etc/patroni/certs/server.crt -keyout /etc/patroni/certs/server.key -subj "/CN=$NODE_IP"
+          chmod 600 /etc/patroni/certs/server.key
+
+          mkdir -p /etc/pgbackrest /var/log/pgbackrest
+          chown postgres:postgres /var/log/pgbackrest
+          cat > /etc/pgbackrest/pgbackrest.conf <<PGBR
+          [global]
+          repo1-type=s3
+          repo1-s3-bucket=$BACKUP_BUCKET
+          repo1-s3-region=$REGION
+          repo1-s3-endpoint=s3.$REGION.amazonaws.com
+          repo1-s3-key-type=auto
+          repo1-path=/pgbackrest
+          repo1-retention-full=4
+          start-fast=y
+          [tsdb]
+          pg1-path=/var/lib/postgresql/16/patroni
+          pg1-port=5432
+          pg1-user=postgres
+          PGBR
+
+          mkdir -p /var/lib/postgresql/16/patroni
+          chown postgres:postgres /var/lib/postgresql/16/patroni
+          chmod 700 /var/lib/postgresql/16/patroni
+
+          cat > /etc/patroni/schema.sql <<'SCHEMA'
+          CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+          CREATE TABLE vehicle_snapshots (
+              captured_at         TIMESTAMPTZ NOT NULL,
+              vin                 TEXT        NOT NULL,
+              envelope            JSONB,
+              location            JSONB,
+              cockpit_data        JSONB,
+              tire_pressure_data  JSONB,
+              health_status_data  JSONB,
+              body_control        JSONB,
+              driver_behavior     JSONB,
+              adas_context        JSONB,
+              cabin_status        JSONB,
+              lighting_visibility JSONB,
+              PRIMARY KEY (vin, captured_at)
+          );
+
+          SELECT create_hypertable('vehicle_snapshots', by_range('captured_at', INTERVAL '1 day'));
+
+          ALTER TABLE vehicle_snapshots SET (
+              timescaledb.compress,
+              timescaledb.compress_segmentby = 'vin',
+              timescaledb.compress_orderby   = 'captured_at DESC'
+          );
+
+          CALL add_columnstore_policy('vehicle_snapshots', after => INTERVAL '7 days');
+          SCHEMA
+
+          cat > /etc/patroni/post_bootstrap.sh <<'PB'
+          #!/bin/bash
+          set -e
+          psql -U postgres -h /var/run/postgresql -f /etc/patroni/schema.sql
+          PB
+          chmod +x /etc/patroni/post_bootstrap.sh
+
+          cat > /etc/patroni/patroni.yml <<PATRONI
+          scope: tsdb-cluster
+          name: $NODE_NAME
+          restapi:
+            listen: $NODE_IP:8008
+            connect_address: $NODE_IP:8008
+          etcd3:
+            hosts:
+              - ${EtcdEni1.PrimaryPrivateIpAddress}:2379
+              - ${EtcdEni2.PrimaryPrivateIpAddress}:2379
+              - ${EtcdEni3.PrimaryPrivateIpAddress}:2379
+          bootstrap:
+            post_bootstrap: /etc/patroni/post_bootstrap.sh
+            dcs:
+              ttl: 30
+              loop_wait: 10
+              retry_timeout: 10
+              maximum_lag_on_failover: 1048576
+              failsafe_mode: true
+              postgresql:
+                use_pg_rewind: true
+                parameters:
+                  wal_level: replica
+                  hot_standby: "on"
+                  max_wal_senders: 10
+                  max_replication_slots: 10
+                  shared_preload_libraries: timescaledb
+                  ssl: "on"
+                  ssl_cert_file: /etc/patroni/certs/server.crt
+                  ssl_key_file: /etc/patroni/certs/server.key
+                  archive_mode: "on"
+                  archive_command: 'pgbackrest --stanza=tsdb archive-push %p'
+            initdb:
+              - encoding: UTF8
+              - data-checksums
+          postgresql:
+            listen: 0.0.0.0:5432
+            connect_address: $NODE_IP:5432
+            data_dir: /var/lib/postgresql/16/patroni
+            bin_dir: /usr/lib/postgresql/16/bin
+            pg_hba:
+              - local all all peer
+              - host all all 127.0.0.1/32 md5
+              - hostssl all all ${VpcCidr} md5
+              - hostssl replication replicator ${VpcCidr} md5
+            authentication:
+              superuser:
+                username: postgres
+                password: testpass123
+              replication:
+                username: replicator
+                password: replpass123
+            parameters:
+              shared_preload_libraries: timescaledb
+          tags:
+            nofailover: false
+            noloadbalance: false
+            clonefrom: false
+            nosync: false
+          PATRONI
+          chown -R postgres:postgres /etc/patroni
+          chmod 600 /etc/patroni/certs/server.key
+
+          cat > /etc/systemd/system/patroni.service <<'UNIT'
+          [Unit]
+          Description=Patroni
+          After=network.target
+          [Service]
+          Type=simple
+          User=postgres
+          Group=postgres
+          ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now patroni
+
+          cat > /opt/is_leader.sh <<'LEAD'
+          #!/bin/bash
+          # Patroni's REST API binds to the node's private IP (not 127.0.0.1),
+          # so we must query that IP. Derive it from IMDS at runtime.
+          TKN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          IP=$(curl -s -H "X-aws-ec2-metadata-token: $TKN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://$IP:8008/primary)
+          [ "$code" = "200" ]
+          LEAD
+          chmod +x /opt/is_leader.sh
+
+          cat > /opt/backup.sh <<'BK'
+          #!/bin/bash
+          /opt/is_leader.sh || exit 0
+          sudo -u postgres pgbackrest --stanza=tsdb stanza-create 2>/dev/null || true
+          if [ "$(date +%u)" = "7" ]; then T=full; else T=incr; fi
+          sudo -u postgres pgbackrest --stanza=tsdb --type=$T backup
+          BK
+          chmod +x /opt/backup.sh
+
+          cat > /opt/archive.sh <<ARCH
+          #!/bin/bash
+          # Run the archival job AS the postgres OS user so local peer auth
+          # succeeds (cron invokes this as root; connecting as postgres over the
+          # unix socket requires the OS user to be postgres). Bucket/region are
+          # passed through into the postgres shell so boto3 can read them.
+          exec sudo -u postgres bash -c 'ARCHIVE_BUCKET="${ArchiveBucket}" REGION="${AWS::Region}" python3 /opt/archive_chunks.py'
+          ARCH
+          chmod +x /opt/archive.sh
+
+          cat > /opt/archive_chunks.py <<'PY'
+          #!/usr/bin/env python3
+          import os, sys, io
+          import psycopg2, pyarrow as pa, pyarrow.parquet as pq, boto3
+          bucket = os.environ["ARCHIVE_BUCKET"]
+          region = os.environ["REGION"]
+          conn = psycopg2.connect("dbname=postgres user=postgres host=/var/run/postgresql")
+          conn.autocommit = True
+          cur = conn.cursor()
+          cur.execute("SELECT pg_is_in_recovery()")
+          if cur.fetchone()[0]:
+              sys.exit(0)
+          cur.execute("""SELECT chunk_schema, chunk_name FROM timescaledb_information.chunks
+                         WHERE hypertable_name='vehicle_snapshots'
+                           AND range_end < now() - INTERVAL '90 days'""")
+          chunks = cur.fetchall()
+          if not chunks:
+              sys.exit(0)
+          s3 = boto3.client("s3", region_name=region)
+          ok = True
+          for schema, name in chunks:
+              try:
+                  rc = conn.cursor()
+                  rc.execute('SELECT * FROM "%s"."%s"' % (schema, name))
+                  cols = [d[0] for d in rc.description]
+                  data = {c: [] for c in cols}
+                  for row in rc.fetchall():
+                      for c, v in zip(cols, row):
+                          data[c].append(None if v is None else str(v))
+                  buf = io.BytesIO()
+                  pq.write_table(pa.table(data), buf)
+                  s3.put_object(Bucket=bucket, Key="vehicle_snapshots/%s.parquet" % name, Body=buf.getvalue())
+                  rc.close()
+              except Exception as e:
+                  sys.stderr.write("failed %s: %s\n" % (name, e))
+                  ok = False
+          if ok:
+              cur.execute("SELECT drop_chunks('vehicle_snapshots', older_than => INTERVAL '90 days')")
+          PY
+          chmod +x /opt/archive_chunks.py
+
+          cat > /etc/cron.d/tsdb-jobs <<'CRON'
+          0 2 * * * root /opt/backup.sh  >> /var/log/tsdb-backup.log 2>&1
+          0 3 * * * root /opt/archive.sh >> /var/log/tsdb-archive.log 2>&1
+          CRON
+
+          # Initial backup is handled by a POST-BOOT systemd oneshot (below),
+          # NOT inline here. Doing it inline raced Patroni's leader election and
+          # kept failing. The oneshot polls until this node is genuinely the
+          # settled leader, then runs stanza-create + first full backup once.
+          cat > /opt/initial_backup.sh <<'IB'
+          #!/bin/bash
+          # Wait (long, no premature give-up) until this node is the settled leader.
+          # If it becomes a stable replica instead, exit cleanly - the leader's
+          # copy of this oneshot performs the backup.
+          for i in $(seq 1 60); do
+            if /opt/is_leader.sh; then
+              sudo -u postgres pgbackrest --stanza=tsdb stanza-create || true
+              sudo -u postgres pgbackrest --stanza=tsdb --type=full backup || true
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 0
+          IB
+          chmod +x /opt/initial_backup.sh
+
+          cat > /etc/systemd/system/tsdb-initial-backup.service <<'IBU'
+          [Unit]
+          Description=TSDB initial pgBackRest backup (post-boot, leader only)
+          After=patroni.service network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/initial_backup.sh
+          [Install]
+          WantedBy=multi-user.target
+          IBU
+          systemctl daemon-reload
+          systemctl enable tsdb-initial-backup.service || true
+          # start without blocking user-data (the oneshot may poll for minutes)
+          systemctl start --no-block tsdb-initial-backup.service || true
+          echo "DB BOOTSTRAP COMPLETE"
+
+  # ---------------------------------------------------------------------------
+  # Internal NLB with two endpoints (write 5432 -> leader, read 5433 -> both)
+  # ---------------------------------------------------------------------------
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: tsdb-nlb
+      Type: network
+      Scheme: internal
+      SecurityGroups: [!Ref NlbSg]
+      Subnets: [!Ref SubnetIdA, !Ref SubnetIdB]
+
+  WriteTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: tsdb-write-tg
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 5432
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8008'
+      HealthCheckPath: /primary        # only the leader returns 200 here
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: '200' }
+      Targets:
+        - { Id: !GetAtt DbEni1.PrimaryPrivateIpAddress, Port: 5432 }
+        - { Id: !GetAtt DbEni2.PrimaryPrivateIpAddress, Port: 5432 }
+
+  ReadTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: tsdb-read-tg
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 5432
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8008'
+      HealthCheckPath: /read-only      # primary AND replicas return 200 here
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: '200' }
+      Targets:
+        - { Id: !GetAtt DbEni1.PrimaryPrivateIpAddress, Port: 5432 }
+        - { Id: !GetAtt DbEni2.PrimaryPrivateIpAddress, Port: 5432 }
+
+  WriteListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 5432
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref WriteTargetGroup }]
+
+  ReadListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 5433
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref ReadTargetGroup }]
+
+# =============================================================================
+Outputs:
+# =============================================================================
+  WriteEndpoint:
+    Description: Connect here for WRITES (port 5432) - always the current leader
+    Value: !Sub '${Nlb.DNSName}:5432'
+  ReadEndpoint:
+    Description: Connect here for READS (port 5433) - spread across primary + replica
+    Value: !Sub '${Nlb.DNSName}:5433'
+  BackupBucketName:
+    Description: pgBackRest S3 bucket (full + incremental + WAL)
+    Value: !Ref BackupBucket
+  ArchiveBucketName:
+    Description: Parquet cold-archive S3 bucket (chunks older than 90 days)
+    Value: !Ref ArchiveBucket
+  AccessNote:
+    Description: How to get a shell (no SSH)
+    Value: 'Use AWS SSM: aws ssm start-session --target <instance-id>'
